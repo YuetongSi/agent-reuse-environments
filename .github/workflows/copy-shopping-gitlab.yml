@@ -1,0 +1,125 @@
+name: Prepare Shopping or GitLab pinned image
+
+on:
+  workflow_dispatch:
+    inputs:
+      site:
+        description: Official benchmark environment to prepare
+        required: true
+        default: shopping
+        type: choice
+        options:
+          - shopping
+          - gitlab
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: prepare-webarena-${{ github.repository }}-${{ inputs.site }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Require a public repository and install transfer tools
+        env:
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY_PRIVATE" = false || {
+            echo 'Use a PUBLIC repository with a standard hosted runner.' >&2
+            exit 1
+          }
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends skopeo
+
+      - name: Copy the official linux amd64 image and verify its digest
+        env:
+          SITE: ${{ inputs.site }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          case "$SITE" in
+            shopping) reviewed="sha256:3e8cb9b945ea9b1c94ab26dba53e8d12dd0406abbf4bf686fd3bb2b6a5908feb" ;;
+            gitlab) reviewed="sha256:673ba94d757c5b3f4bb55751ad8b745a33bad2b987349322403cbc41035a92e0" ;;
+            *) echo 'Unsupported benchmark environment' >&2; exit 1 ;;
+          esac
+          upstream="docker.io/am1n3e/webarena-verified-${SITE}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          destination="ghcr.io/${owner}/webarena-verified-${SITE}"
+          tag="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          authfile="${RUNNER_TEMP}/webarena-ghcr-auth.json"
+          work="$(mktemp -d "${RUNNER_TEMP}/webarena-image.XXXXXXXX")"
+          trap 'rm -f -- "$authfile"' EXIT
+
+          # Inspect upstream metadata first; never use benchmark credentials.
+          skopeo inspect --raw "docker://${upstream}@${reviewed}" > "$work/top.json"
+          child="$(python3 - "$work/top.json" <<'PY'
+          import json, re, sys
+          value = json.load(open(sys.argv[1], encoding='utf-8'))
+          manifests = value.get('manifests')
+          if manifests is None:
+              print('single')
+          else:
+              matches = [m['digest'] for m in manifests
+                         if m.get('platform', {}).get('os') == 'linux'
+                         and m.get('platform', {}).get('architecture') == 'amd64']
+              if len(matches) != 1 or not re.fullmatch(r'sha256:[0-9a-f]{64}', matches[0]):
+                  raise SystemExit('Expected one official linux/amd64 manifest')
+              print(matches[0])
+          PY
+          )"
+          if [ "$child" = single ]; then
+            cp "$work/top.json" "$work/image.json"
+          else
+            skopeo inspect --raw "docker://${upstream}@${child}" > "$work/image.json"
+          fi
+          digest="$(skopeo manifest-digest "$work/image.json")"
+          test "$digest" = "$reviewed"
+          details="$(skopeo inspect --no-tags "docker://${upstream}@${digest}")"
+          printf '%s' "$details" > "$work/details.json"
+          config_digest="$(python3 - "$work/image.json" "$work/details.json" <<'PY'
+          import json, re, sys
+          manifest = json.load(open(sys.argv[1], encoding='utf-8'))
+          details = json.load(open(sys.argv[2], encoding='utf-8'))
+          if details.get('Os') != 'linux' or details.get('Architecture') != 'amd64':
+              raise SystemExit('Unexpected source image platform')
+          digest = manifest.get('config', {}).get('digest', '')
+          if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+              raise SystemExit('Missing source config digest')
+          print(digest)
+          PY
+          )"
+
+          printf '%s' "$GH_TOKEN" | skopeo login --authfile "$authfile" \
+            --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          skopeo copy --preserve-digests --retry-times 2 \
+            --dest-authfile "$authfile" --digestfile "$work/copied-digest.txt" \
+            "docker://${upstream}@${digest}" "docker://${destination}:${tag}"
+          copied="$(tr -d '\r\n' < "$work/copied-digest.txt")"
+          test "$copied" = "$digest" || {
+            echo 'Source and destination manifest digests differ' >&2
+            exit 1
+          }
+          skopeo inspect --raw --authfile "$authfile" \
+            "docker://${destination}@${digest}" > "$work/destination.json"
+          test "$(skopeo manifest-digest "$work/destination.json")" = "$digest"
+
+          {
+            printf '# Verified WebArena image preparation\n\n'
+            printf 'Official source: `%s@%s`\n\n' "$upstream" "$digest"
+            printf 'Destination: `%s@%s`\n\n' "$destination" "$digest"
+            printf 'Source configuration digest (runtime ID can differ): `%s`\n\n' "$config_digest"
+            printf 'Platform: `linux/amd64`\n\n'
+            printf 'Copy verification: identical manifest digest; no image rebuild.\n\n'
+            printf '**Before server download:** set this container package visibility to Public in Package settings.\n\n'
+            printf '```bash\ndocker pull --platform linux/amd64 %s@%s\n```\n' "$destination" "$digest"
+            printf '\nThis prepares a deployment dependency only; it does not run an Agent or benchmark task.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
